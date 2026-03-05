@@ -47,6 +47,33 @@ except:
 io_logger = logging.getLogger(__name__)
 
 def logger_setup(cp_path=".cellpose", logfile_name="run.log", stdout_file_replacement=None):
+    """Set up logging to a file and stdout (or a file replacement).
+
+    Creates the log directory if it doesn't exist, removes any existing log
+    file, and configures the root logger to write INFO-level and above messages
+    to both a log file and stdout (or a replacement file).
+
+    Parameters
+    ----------
+    cp_path : str, optional
+        Directory name under the user's home directory for log output.
+        Default is ".cellpose".
+    logfile_name : str, optional
+        Name of the log file created inside cp_path. Default is "run.log".
+    stdout_file_replacement : str or None, optional
+        If provided, log output is written to this file path instead of stdout.
+
+    Returns
+    -------
+    logger : logging.Logger
+        Configured logger for this module. Only INFO and above messages are
+        emitted by default. To enable debug output, call
+        ``logger.setLevel(logging.DEBUG)`` on the returned logger.
+
+    Notes
+    -----
+    The log file is deleted and recreated on each call.
+    """
     cp_dir = pathlib.Path.home().joinpath(cp_path)
     cp_dir.mkdir(exist_ok=True)
     log_file = cp_dir.joinpath(logfile_name)
@@ -189,6 +216,28 @@ def imread(filename):
         if not ND2:
             io_logger.critical("ERROR: need to 'pip install nd2' to load in .nd2 file")
             return None
+        else:
+            with nd2.ND2File(filename) as nd2_file:
+                img = nd2_file.asarray()
+                sizes = nd2_file.sizes
+
+            kept_axes = [nd2.AXIS.Y, nd2.AXIS.X, nd2.AXIS.CHANNEL, nd2.AXIS.Z]
+            # For multi-dimensional data (T, P, etc.), take first frame/position
+            # Work backwards through axes to avoid index shifting
+            for i, (ax_name, size) in reversed(list(enumerate(sizes.items()))):
+                # Keep Y, X, C, Z; remove or reduce everything else
+                if ax_name not in kept_axes:
+                    if size > 1:
+                        io_logger.warning(
+                            f"ND2 file has {size} {ax_name} - using first only"
+                        )
+                    # Take first element (works for both size=1 and size>1)
+                    img = np.take(img, 0, axis=i)
+
+            # Result should now be YX, CYX, ZYX, or CZYX depending on original axes
+            # nd2 preserves axis order from sizes dict (usually C, Z, Y, X)
+            return img
+
     elif ext == ".nrrd":
         if not NRRD:
             io_logger.critical(
@@ -230,6 +279,8 @@ def imread_2D(img_file):
         img_out (numpy.ndarray): The 3-channel image data as a NumPy array.
     """
     img = imread(img_file)
+    if img is None:
+        raise ValueError(f"could not read image file {img_file}")
     return transforms.convert_image(img, do_3D=False)
 
 
@@ -237,16 +288,22 @@ def imread_3D(img_file):
     """
     Read in a 3D image file and convert it to have a channel axis last automatically. Attempts to do this for multi-channel and grayscale images.
 
-    If multichannel image, the channel axis is assumed to be the smallest dimension, and the z axis is the next smallest dimension. 
-    Use `cellpose.io.imread()` to load the full image without selecting the z and channel axes. 
-    
+    For grayscale images (3D array), axis 0 is assumed to be the Z axis (e.g., Z x Y x X).
+    For multichannel images (4D array), the channel axis is assumed to be the smallest dimension,
+    and the Z axis is assumed to be the first remaining axis after the channel axis is removed.
+
+    Use ``cellpose.io.imread()`` to load the full image without automatic axis selection,
+    then specify ``z_axis`` and ``channel_axis`` manually when calling ``model.eval``.
+
     Args:
         img_file (str): The path to the image file.
 
     Returns:
-        img_out (numpy.ndarray): The image data as a NumPy array.
+        img_out (numpy.ndarray): The image data as a NumPy array with channels last, or None if loading fails.
     """
     img = imread(img_file)
+    if img is None:
+        raise ValueError(f"could not read image file {img_file}")
 
     dimension_lengths = list(img.shape)
 
@@ -254,16 +311,15 @@ def imread_3D(img_file):
     if img.ndim == 3:
         channel_axis = None
         # guess at z axis:
-        z_axis = np.argmin(dimension_lengths)
+        z_axis = 0
 
     elif img.ndim == 4:
         # guess at channel axis:
         channel_axis = np.argmin(dimension_lengths)
-
-        # guess at z axis: 
-        # set channel axis to max so argmin works:
-        dimension_lengths[channel_axis] = max(dimension_lengths)
-        z_axis = np.argmin(dimension_lengths)
+        dimensions = list(range(img.ndim))
+        dimensions.pop(channel_axis)
+        # guess at z axis as the first remaining dimension: 
+        z_axis = dimensions[0]
 
     else: 
         raise ValueError(f'image shape error, 3D image must 3 or 4 dimensional. Number of dimensions: {img.ndim}')
@@ -638,30 +694,34 @@ def save_to_png(images, masks, flows, file_names):
     save_masks(images, masks, flows, file_names, png=True)
 
 
-def save_rois(masks, file_name, multiprocessing=None):
+def save_rois(masks, file_name, multiprocessing=None, prefix='', pad=False):
     """ save masks to .roi files in .zip archive for ImageJ/Fiji
+    When opened in ImageJ, the ROIs will be named [prefix][0000]n where n is 1,2,... corresponding to the masks label
 
     Args:
         masks (np.ndarray): masks output from Cellpose.eval, where 0=NO masks; 1,2,...=mask labels
         file_name (str): name to save the .zip file to
+        multiprocessing (bool, optional): Flag to enable multiprocessing. Defaults to None (disabled).
+        prefix (str, optional): prefix to add at the beginning of the ROI labels in ImageJ. Defaults to no prefix
+        pad (bool, optional): Whether to pad the numerical part of the label with zeros so that all labels have the same length
 
     Returns:
         None
     """
     outlines = utils.outlines_list(masks, multiprocessing=multiprocessing)
-    nonempty_outlines = [outline for outline in outlines if len(outline)!=0]
-    if len(outlines)!=len(nonempty_outlines):
-        print(f"empty outlines found, saving {len(nonempty_outlines)} ImageJ ROIs to .zip archive.")
-    rois = [ImagejRoi.frompoints(outline) for outline in nonempty_outlines]
+    
+    n_digits = int(np.floor(np.log10(masks.max()))+1) if pad else 0
+    fmt = f'{{prefix}}{{id:0{n_digits}d}}'
+    rois = []
+    for n,outline in zip(np.unique(masks)[1:], outlines):
+        if len(outline) > 0:
+            rois.append(ImagejRoi.frompoints(outline, name=fmt.format(prefix=prefix, id=n)))
+
+    if len(outlines) != len(rois):
+        print(f"empty outlines found, saving {len(rois)} ImageJ ROIs to .zip archive.")
+
     file_name = os.path.splitext(file_name)[0] + '_rois.zip'
-
-
-    # Delete file if it exists; the roifile lib appends to existing zip files.
-    # If the user removed a mask it will still be in the zip file
-    if os.path.exists(file_name):
-        os.remove(file_name)
-
-    roiwrite(file_name, rois)
+    roiwrite(file_name, rois, mode='w')
 
 
 def save_masks(images, masks, flows, file_names, png=True, tif=False, channels=[0, 0],
@@ -692,7 +752,7 @@ def save_masks(images, masks, flows, file_names, png=True, tif=False, channels=[
         save_outlines (bool, optional): Save outlines of masks. Defaults to False.
         dir_above (bool, optional): Save masks/flows in directory above. Defaults to False.
         in_folders (bool, optional): Save masks/flows in separate folders. Defaults to False.
-        savedir (str, optional): Absolute path where images will be saved. If None, saves to image directory. Defaults to None.
+        savedir (str, optional): Absolute or relative path where images will be saved. If None, saves to image directory. Defaults to None.
         save_txt (bool, optional): Save masks as list of outlines for ImageJ. Defaults to False.
         save_mpl (bool, optional): If True, saves a matplotlib figure of the original image/segmentation/flows. Does not work for 3D.
                 This takes a long time for large images. Defaults to False.
@@ -724,11 +784,11 @@ def save_masks(images, masks, flows, file_names, png=True, tif=False, channels=[
 
     if savedir is None:
         if dir_above:
-            savedir = Path(file_names).parent.parent.absolute(
-            )  #go up a level to save in its own folder
+            savedir = Path(file_names).parent.parent#go up a level to save in its own folder
         else:
-            savedir = Path(file_names).parent.absolute()
+            savedir = Path(file_names).parent
 
+    savedir = Path(savedir).resolve()
     check_dir(savedir)
 
     basename = os.path.splitext(os.path.basename(file_names))[0]
@@ -811,6 +871,7 @@ def save_masks(images, masks, flows, file_names, png=True, tif=False, channels=[
     if masks.ndim < 3 and save_flows:
         check_dir(flowdir)
         imsave(os.path.join(flowdir, basename + "_flows" + suffix + ".tif"),
-               (flows[0] * (2**16 - 1)).astype(np.uint16))
+               flows[0]
+              )
         #save full flow data
         imsave(os.path.join(flowdir, basename + '_dP' + suffix + '.tif'), flows[1])

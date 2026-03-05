@@ -49,7 +49,9 @@ class Transformer(nn.Module):
         for blk in self.encoder.blocks:
             blk.window_size = 0
 
-        self.dtype = dtype
+        self._dtype = dtype
+        if dtype != torch.float32:
+            self.dtype = dtype
 
     def forward(self, x):      
         # same progression as SAM until readout
@@ -77,11 +79,18 @@ class Transformer(nn.Module):
         
         # maintain the second output of feature size 256 for backwards compatibility
            
-        return x1, torch.randn((x.shape[0], 256), device=x.device)
+        return x1, torch.zeros((x.shape[0], 256), device=x.device)
     
-    def load_model(self, PATH, device, strict = False):        
+    def load_model(self, PATH, device, strict = False):
         state_dict = torch.load(PATH, map_location = device, weights_only=True)
         keys = [k for k in state_dict.keys()]
+
+        # loudly fail on attempt to load not cp4 model: 
+        w2_data = state_dict.get('W2', None)
+        if w2_data == None:
+            raise ValueError('This model does not appear to be a CP4 model. CP3 models are not compatible with CP4.')
+
+        # models are always saved as float32
         if keys[0][:7] == "module.":
             from collections import OrderedDict
             new_state_dict = OrderedDict()
@@ -95,6 +104,27 @@ class Transformer(nn.Module):
         if self.dtype != torch.float32:
             self = self.to(self.dtype)
 
+    @property
+    def dtype(self):
+        """
+        Get the data type of the model.
+
+        Returns:
+            torch.dtype: The data type of the model.
+        """
+        return self._dtype
+    
+    @dtype.setter
+    def dtype(self, value):
+        """
+        Set the data type of the model.
+
+        Args:
+            value (torch.dtype): The data type to set for the model.
+        """
+        if self._dtype != value:
+            self.to(value)
+            self._dtype = value
     
     @property
     def device(self):
