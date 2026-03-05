@@ -185,6 +185,19 @@ The first time cellpose runs it downloads the latest available trained model wei
 
 You can now **drag and drop** any images (*.tif, *.png, *.jpg, *.gif) into the GUI and run Cellpose, and/or manually segment them. When the GUI is processing, you will see the progress bar fill up and during this time you cannot click on anything in the GUI. For more information about what the GUI is doing you can look at the terminal/prompt you opened the GUI with. For example data, see [website](https://www.cellpose.org) or this [zip file](https://www.cellpose.org/static/images/demo_images.zip). For best accuracy and runtime performance, resize images so cells are less than 100 pixels across. If you have 3D tiffs, open the GUI with `python -m cellpose --Zstack
 
+
+## Usage with apptainer
+
+Create .sif with display
+```bash
+apptainer run --cleanenv --nv -B /tmp/.X11-unix:/tmp/.X11-unix -B $HOME/.Xauthority:/root/.Xauthority --env DISPLAY=$DISPLAY mi_app.sif
+```
+
+Execute cellpose in multi thread using GPU
+```bash
+apptainer exec --nv cellpose.sif python3 -m cellpose --dir /users/sherna55/Downloads/V7/ --use_gpu --save_png --verbose
+```
+
 ## Step-by-step demo
 
 1. Download this [zip file](https://www.cellpose.org/static/images/demo_images.zip) of images and unzip it. These are a subset of the test images from the paper.
